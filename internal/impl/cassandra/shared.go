@@ -25,18 +25,22 @@ import (
 )
 
 const (
-	cFieldAddresses           = "addresses"
-	cFieldTLS                 = "tls"
-	cFieldPassAuth            = "password_authenticator"
-	cFieldPassAuthEnabled     = "enabled"
-	cFieldPassAuthUsername    = "username"
-	cFieldPassAuthPassword    = "password"
-	cFieldDisableIHL          = "disable_initial_host_lookup"
-	cFieldMaxRetries          = "max_retries"
-	cFieldBackoff             = "backoff"
-	cFieldBackoffInitInterval = "initial_interval"
-	cFieldBackoffMaxInterval  = "max_interval"
-	cFieldTimeout             = "timeout"
+	cFieldAddresses                      = "addresses"
+	cFieldTLS                            = "tls"
+	cFieldPassAuth                       = "password_authenticator"
+	cFieldPassAuthEnabled                = "enabled"
+	cFieldPassAuthUsername               = "username"
+	cFieldPassAuthPassword               = "password"
+	cFieldDisableIHL                     = "disable_initial_host_lookup"
+	cFieldMaxRetries                     = "max_retries"
+	cFieldBackoff                        = "backoff"
+	cFieldBackoffInitInterval            = "initial_interval"
+	cFieldBackoffMaxInterval             = "max_interval"
+	cFieldTimeout                        = "timeout"
+	cFieldHostSelectionPolicy            = "host_selection_policy"
+	cFieldHostSelectionPolicyFallPrimary = "primary"
+	cFieldHostSelectionPolicyFallback    = "fallback"
+	cFieldHostSelectionPolicyLocalDC     = "local_dc"
 )
 
 func clientFields() []*service.ConfigField {
@@ -84,6 +88,19 @@ func clientFields() []*service.ConfigField {
 		service.NewDurationField(cFieldTimeout).
 			Description("The client connection timeout.").
 			Default("600ms"),
+		service.NewObjectField(cFieldHostSelectionPolicy,
+			service.NewStringEnumField(cFieldHostSelectionPolicyFallPrimary, "round_robin", "token_aware", "dc_aware", "rack_aware").
+				Description("The host selection policy to use").
+				Default("round_robin"),
+			service.NewStringEnumField(cFieldHostSelectionPolicyFallback, "none", "round_robin", "token_aware", "dc_aware", "rack_aware").
+				Description("The fallback host selection policy to use").
+				Default("none"),
+			service.NewStringField(cFieldHostSelectionPolicyLocalDC).
+				Description("The local DC to use").
+				Default(""),
+		).
+			Description("Optional host selection policy configurations").
+			Advanced(),
 	}
 }
 
@@ -99,6 +116,7 @@ type clientConf struct {
 	backoffInitInterval time.Duration
 	backoffMaxInterval  time.Duration
 	timeout             time.Duration
+	hostSelectionPolicy gocql.HostSelectionPolicy
 }
 
 func (c *clientConf) Create() (*gocql.ClusterConfig, error) {
@@ -111,6 +129,8 @@ func (c *clientConf) Create() (*gocql.ClusterConfig, error) {
 	} else {
 		conn.DisableInitialHostLookup = c.disableIHL
 	}
+
+	conn.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(c.hostSelectionPolicy)
 
 	if c.authEnabled {
 		conn.Authenticator = gocql.PasswordAuthenticator{
@@ -164,5 +184,44 @@ func clientConfFromParsed(conf *service.ParsedConfig) (c clientConf, err error) 
 	if c.timeout, err = conf.FieldDuration(cFieldTimeout); err != nil {
 		return
 	}
+
+	hostConf := conf.Namespace(cFieldHostSelectionPolicy)
+	fallback, err := hostConf.FieldString(cFieldHostSelectionPolicyFallback)
+
+	if err != nil {
+		panic(err)
+	}
+	localDC, err := hostConf.FieldString(cFieldHostSelectionPolicyLocalDC)
+	if err != nil {
+		panic(err)
+	}
+	if c.hostSelectionPolicy, err = hostSelectionPolicy(fallback, localDC); err != nil {
+		return
+	}
+
 	return
+}
+
+type hostSelection string
+
+func (h hostSelection) String() string {
+	return string(h)
+}
+
+const (
+	roundRobin hostSelection = "round_robin"
+	tokenAware hostSelection = "token_aware"
+	rackAware  hostSelection = "rack_aware"
+	dcAware    hostSelection = "dc_aware"
+)
+
+func hostSelectionPolicy(fallback string, localDC string) (policy gocql.HostSelectionPolicy, err error) {
+	switch fallback {
+	case tokenAware.String():
+		return gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy()), nil
+	case dcAware.String():
+		return gocql.DCAwareRoundRobinPolicy(localDC), nil
+	default:
+		return nil, err
+	}
 }
