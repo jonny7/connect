@@ -16,6 +16,7 @@ package cassandra
 
 import (
 	"crypto/tls"
+	"fmt"
 	"strings"
 	"time"
 
@@ -25,18 +26,23 @@ import (
 )
 
 const (
-	cFieldAddresses           = "addresses"
-	cFieldTLS                 = "tls"
-	cFieldPassAuth            = "password_authenticator"
-	cFieldPassAuthEnabled     = "enabled"
-	cFieldPassAuthUsername    = "username"
-	cFieldPassAuthPassword    = "password"
-	cFieldDisableIHL          = "disable_initial_host_lookup"
-	cFieldMaxRetries          = "max_retries"
-	cFieldBackoff             = "backoff"
-	cFieldBackoffInitInterval = "initial_interval"
-	cFieldBackoffMaxInterval  = "max_interval"
-	cFieldTimeout             = "timeout"
+	cFieldAddresses                      = "addresses"
+	cFieldTLS                            = "tls"
+	cFieldPassAuth                       = "password_authenticator"
+	cFieldPassAuthEnabled                = "enabled"
+	cFieldPassAuthUsername               = "username"
+	cFieldPassAuthPassword               = "password"
+	cFieldDisableIHL                     = "disable_initial_host_lookup"
+	cFieldMaxRetries                     = "max_retries"
+	cFieldBackoff                        = "backoff"
+	cFieldBackoffInitInterval            = "initial_interval"
+	cFieldBackoffMaxInterval             = "max_interval"
+	cFieldTimeout                        = "timeout"
+	cFieldHostSelectionPolicy            = "host_selection_policy"
+	cFieldHostSelectionPolicyFallPrimary = "primary"
+	cFieldHostSelectionPolicyFallback    = "fallback"
+	cFieldHostSelectionPolicyLocalDC     = "local_dc"
+	cFieldHostSelectionPolicyLocalRack   = "local_rack"
 )
 
 func clientFields() []*service.ConfigField {
@@ -84,6 +90,22 @@ func clientFields() []*service.ConfigField {
 		service.NewDurationField(cFieldTimeout).
 			Description("The client connection timeout.").
 			Default("600ms"),
+		service.NewObjectField(cFieldHostSelectionPolicy,
+			service.NewStringEnumField(cFieldHostSelectionPolicyFallPrimary, "round_robin", "token_aware").
+				Description("host selection policy to use").
+				Default("token_aware"),
+			service.NewStringEnumField(cFieldHostSelectionPolicyFallback, "", "round_robin", "dc_aware", "rack_aware").
+				Description("Optional fallback host selection policy to use").
+				Default(""),
+			service.NewStringField(cFieldHostSelectionPolicyLocalDC).
+				Description("The local DC to use, this is only applicable for the DC Aware & Rack Aware policies").
+				Default(""),
+			service.NewStringField(cFieldHostSelectionPolicyLocalRack).
+				Description("The local Rack to use, this is only applicable for the Rack Aware Policy").
+				Default(""),
+		).
+			Description("Optional host selection policy configurations").
+			Advanced(),
 	}
 }
 
@@ -99,6 +121,7 @@ type clientConf struct {
 	backoffInitInterval time.Duration
 	backoffMaxInterval  time.Duration
 	timeout             time.Duration
+	hostSelectionPolicy gocql.HostSelectionPolicy
 }
 
 func (c *clientConf) Create() (*gocql.ClusterConfig, error) {
@@ -118,6 +141,8 @@ func (c *clientConf) Create() (*gocql.ClusterConfig, error) {
 			Password: c.authPassword,
 		}
 	}
+
+	conn.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy("use1-bidbucket-scylla"))
 
 	conn.RetryPolicy = &decorator{
 		NumRetries: c.maxRetries,
@@ -165,4 +190,31 @@ func clientConfFromParsed(conf *service.ParsedConfig) (c clientConf, err error) 
 		return
 	}
 	return
+}
+
+type hostSelection string
+
+const (
+	roundRobin hostSelection = "round_robin"
+	rackAware  hostSelection = "rack_aware"
+	dcAware    hostSelection = "dc_aware"
+)
+
+func newHostSelectionPolicy(policy hostSelection, localDC, localRack string) (gocql.HostSelectionPolicy, error) {
+	switch policy {
+	case rackAware:
+		if localDC != "" && localRack != "" {
+			return gocql.RackAwareRoundRobinPolicy(localDC, localRack), nil
+		}
+		return nil, fmt.Errorf("rack-aware drivers require both a local DC and a local Rack")
+	case dcAware:
+		if localDC != "" {
+			return gocql.DCAwareRoundRobinPolicy(localDC), nil
+		}
+		return nil, fmt.Errorf("dc-aware drivers require a local DC")
+	case roundRobin:
+		return gocql.RoundRobinHostPolicy(), nil
+	default:
+		return nil, fmt.Errorf("unknown primary host selection policy")
+	}
 }
