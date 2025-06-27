@@ -26,23 +26,30 @@ import (
 )
 
 const (
-	cFieldAddresses                      = "addresses"
-	cFieldTLS                            = "tls"
-	cFieldPassAuth                       = "password_authenticator"
-	cFieldPassAuthEnabled                = "enabled"
-	cFieldPassAuthUsername               = "username"
-	cFieldPassAuthPassword               = "password"
-	cFieldDisableIHL                     = "disable_initial_host_lookup"
-	cFieldMaxRetries                     = "max_retries"
-	cFieldBackoff                        = "backoff"
-	cFieldBackoffInitInterval            = "initial_interval"
-	cFieldBackoffMaxInterval             = "max_interval"
-	cFieldTimeout                        = "timeout"
-	cFieldHostSelectionPolicy            = "host_selection_policy"
-	cFieldHostSelectionPolicyFallPrimary = "primary"
-	cFieldHostSelectionPolicyFallback    = "fallback"
-	cFieldHostSelectionPolicyLocalDC     = "local_dc"
-	cFieldHostSelectionPolicyLocalRack   = "local_rack"
+	cFieldAddresses                               = "addresses"
+	cFieldTLS                                     = "tls"
+	cFieldPassAuth                                = "password_authenticator"
+	cFieldPassAuthEnabled                         = "enabled"
+	cFieldPassAuthUsername                        = "username"
+	cFieldPassAuthPassword                        = "password"
+	cFieldDisableIHL                              = "disable_initial_host_lookup"
+	cFieldMaxRetries                              = "max_retries"
+	cFieldBackoff                                 = "backoff"
+	cFieldBackoffInitInterval                     = "initial_interval"
+	cFieldBackoffMaxInterval                      = "max_interval"
+	cFieldTimeout                                 = "timeout"
+	cFieldWriteTimeout                            = "write_timeout"
+	cFieldMaxRequestsPerConnection                = "max_requests_per_connection"
+	cFieldReconnectInterval                       = "reconnect_interval"
+	cFieldHostSelectionPolicy                     = "host_selection_policy"
+	cFieldHostSelectionPolicyPrimary              = "primary"
+	cFieldHostSelectionPolicyFallback             = "fallback"
+	cFieldHostSelectionPolicyLocalDC              = "local_dc"
+	cFieldHostSelectionPolicyLocalRack            = "local_rack"
+	cFieldExponentialReconnectionPolicy           = "exponential_reconnection"
+	cFieldExponentialReconnectionPolicyMaxRetries = "reconnection_max_retries"
+	cFieldExponentialReconnectionInitialInterval  = "reconnection_initial_interval"
+	cFieldExponentialReconnectionMaxInterval      = "reconnection_max_interval"
 )
 
 func clientFields() []*service.ConfigField {
@@ -91,9 +98,9 @@ func clientFields() []*service.ConfigField {
 			Description("The client connection timeout.").
 			Default("600ms"),
 		service.NewObjectField(cFieldHostSelectionPolicy,
-			service.NewStringEnumField(cFieldHostSelectionPolicyFallPrimary, "round_robin", "token_aware").
+			service.NewStringEnumField(cFieldHostSelectionPolicyPrimary, "round_robin", "token_aware").
 				Description("host selection policy to use").
-				Default("token_aware"),
+				Default("round_robin"),
 			service.NewStringEnumField(cFieldHostSelectionPolicyFallback, "", "round_robin", "dc_aware", "rack_aware").
 				Description("Optional fallback host selection policy to use").
 				Default(""),
@@ -102,56 +109,85 @@ func clientFields() []*service.ConfigField {
 				Default(""),
 			service.NewStringField(cFieldHostSelectionPolicyLocalRack).
 				Description("The local Rack to use, this is only applicable for the Rack Aware Policy").
-				Default(""),
+				Optional(),
 		).
 			Description("Optional host selection policy configurations").
+			Advanced(),
+		service.NewDurationField(cFieldWriteTimeout).
+			Description("limits the time the driver waits to write a request to a network connection").
+			Default("600ms"),
+		service.NewIntField(cFieldMaxRequestsPerConnection).
+			Description("Maximum number of inflight requests allowed per connection").
+			Default(32768),
+		service.NewDurationField(cFieldReconnectInterval).
+			Description("If not zero, gocql attempt to reconnect known DOWN nodes in every ReconnectInterval.").
+			Default("60s"),
+		service.NewObjectField(cFieldExponentialReconnectionPolicy,
+			service.NewIntField(cFieldExponentialReconnectionPolicyMaxRetries).
+				Description("The maximum number of retry attempts."),
+			service.NewDurationField(cFieldExponentialReconnectionInitialInterval).
+				Description("The initial period to wait between retry attempts."),
+			service.NewDurationField(cFieldExponentialReconnectionMaxInterval).
+				Description("The maximum period to wait between retry attempts."),
+		).
+			Description("Optional exponential reconnection policy, defaults to driver default of constant reconnection policy").
+			Optional().
 			Advanced(),
 	}
 }
 
 type clientConf struct {
-	addresses           []string
-	tlsEnabled          bool
-	tlsConf             *tls.Config
-	authEnabled         bool
-	authUsername        string
-	authPassword        string
-	disableIHL          bool
-	maxRetries          int
-	backoffInitInterval time.Duration
-	backoffMaxInterval  time.Duration
-	timeout             time.Duration
-	hostSelectionPolicy gocql.HostSelectionPolicy
+	addresses                []string
+	tlsEnabled               bool
+	tlsConf                  *tls.Config
+	authEnabled              bool
+	authUsername             string
+	authPassword             string
+	disableIHL               bool
+	maxRetries               int
+	backoffInitInterval      time.Duration
+	backoffMaxInterval       time.Duration
+	timeout                  time.Duration
+	hostSelectionPolicy      gocql.HostSelectionPolicy
+	writeTimeout             time.Duration
+	maxRequestsPerConnection int
+	reconnectInterval        time.Duration
+	reconnectionPolicy       gocql.ReconnectionPolicy
 }
 
 func (c *clientConf) Create() (*gocql.ClusterConfig, error) {
-	conn := gocql.NewCluster(c.addresses...)
+	cluster := gocql.NewCluster(c.addresses...)
 	if c.tlsEnabled {
-		conn.SslOpts = &gocql.SslOptions{
+		cluster.SslOpts = &gocql.SslOptions{
 			Config: c.tlsConf,
 		}
-		conn.DisableInitialHostLookup = c.tlsConf.InsecureSkipVerify
+		cluster.DisableInitialHostLookup = c.tlsConf.InsecureSkipVerify
 	} else {
-		conn.DisableInitialHostLookup = c.disableIHL
+		cluster.DisableInitialHostLookup = c.disableIHL
 	}
 
 	if c.authEnabled {
-		conn.Authenticator = gocql.PasswordAuthenticator{
+		cluster.Authenticator = gocql.PasswordAuthenticator{
 			Username: c.authUsername,
 			Password: c.authPassword,
 		}
 	}
 
-	conn.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy("use1-bidbucket-scylla"))
+	cluster.PoolConfig.HostSelectionPolicy = c.hostSelectionPolicy
 
-	conn.RetryPolicy = &decorator{
+	cluster.RetryPolicy = &decorator{
 		NumRetries: c.maxRetries,
 		Min:        c.backoffInitInterval,
 		Max:        c.backoffMaxInterval,
 	}
 
-	conn.Timeout = c.timeout
-	return conn, nil
+	cluster.Timeout = c.timeout
+	cluster.WriteTimeout = c.writeTimeout
+	cluster.MaxRequestsPerConn = c.maxRequestsPerConnection
+	cluster.ReconnectInterval = c.reconnectInterval
+	cluster.ReconnectionPolicy = c.reconnectionPolicy
+
+	return cluster, nil
 }
 
 func clientConfFromParsed(conf *service.ParsedConfig) (c clientConf, err error) {
@@ -189,18 +225,79 @@ func clientConfFromParsed(conf *service.ParsedConfig) (c clientConf, err error) 
 	if c.timeout, err = conf.FieldDuration(cFieldTimeout); err != nil {
 		return
 	}
+	if c.writeTimeout, err = conf.FieldDuration(cFieldWriteTimeout); err != nil {
+		return
+	}
+	if c.maxRequestsPerConnection, err = conf.FieldInt(cFieldMaxRequestsPerConnection); err != nil {
+		return
+	}
+	if c.reconnectInterval, err = conf.FieldDuration(cFieldReconnectInterval); err != nil {
+		return
+	}
+
+	{
+		hostSelection := conf.Namespace(cFieldHostSelectionPolicy)
+		primary, _ := hostSelection.FieldString(cFieldHostSelectionPolicyPrimary)
+		fallback, _ := hostSelection.FieldString(cFieldHostSelectionPolicyFallback)
+		localDC, _ := hostSelection.FieldString(cFieldHostSelectionPolicyLocalDC)
+		localRack, _ := hostSelection.FieldString(cFieldHostSelectionPolicyLocalRack)
+		if c.hostSelectionPolicy, err = newHostSelectionPolicy(primaryHostSelection(primary), fallbackHostSelection(fallback), localDC, localRack); err != nil {
+			return
+		}
+	}
+
+	{
+		reconnectionPolicy := conf.Namespace(cFieldExponentialReconnectionPolicy)
+		initial, _ := reconnectionPolicy.FieldDuration(cFieldExponentialReconnectionInitialInterval)
+		maxRetries, _ := reconnectionPolicy.FieldInt(cFieldExponentialReconnectionPolicyMaxRetries)
+		maxInterval, _ := reconnectionPolicy.FieldDuration(cFieldExponentialReconnectionMaxInterval)
+		c.reconnectionPolicy = newReconnectionPolicy(initial, maxRetries, maxInterval)
+	}
 	return
 }
 
-type hostSelection string
+func newReconnectionPolicy(initialInterval time.Duration, MaxRetries int, MaxInterval time.Duration) gocql.ReconnectionPolicy {
+	if initialInterval == 0 || MaxRetries == 0 || MaxInterval == 0 {
+		return &gocql.ConstantReconnectionPolicy{MaxRetries: 3, Interval: 1 * time.Second}
+	}
+	return &gocql.ExponentialReconnectionPolicy{
+		MaxRetries:      MaxRetries,
+		InitialInterval: initialInterval,
+		MaxInterval:     MaxInterval,
+	}
+}
+
+type primaryHostSelection string
 
 const (
-	roundRobin hostSelection = "round_robin"
-	rackAware  hostSelection = "rack_aware"
-	dcAware    hostSelection = "dc_aware"
+	roundRobinPrimaryHostSelection primaryHostSelection = "round_robin"
+	tokenAwarePrimaryHostSelection primaryHostSelection = "token_aware"
 )
 
-func newHostSelectionPolicy(policy hostSelection, localDC, localRack string) (gocql.HostSelectionPolicy, error) {
+type fallbackHostSelection string
+
+const (
+	roundRobin fallbackHostSelection = "round_robin"
+	rackAware  fallbackHostSelection = "rack_aware"
+	dcAware    fallbackHostSelection = "dc_aware"
+)
+
+func newHostSelectionPolicy(policy primaryHostSelection, fallback fallbackHostSelection, localDC, localRack string) (gocql.HostSelectionPolicy, error) {
+	switch policy {
+	case roundRobinPrimaryHostSelection:
+		return gocql.RoundRobinHostPolicy(), nil
+	case tokenAwarePrimaryHostSelection:
+		selectionPolicy, err := hostSelectionPolicy(fallback, localDC, localRack)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create token-aware policy with fallback: %w", err)
+		}
+		return gocql.TokenAwareHostPolicy(selectionPolicy), nil
+	default:
+		return nil, fmt.Errorf("unsupported host selection policy: %s", policy)
+	}
+}
+
+func hostSelectionPolicy(policy fallbackHostSelection, localDC, localRack string) (gocql.HostSelectionPolicy, error) {
 	switch policy {
 	case rackAware:
 		if localDC != "" && localRack != "" {
